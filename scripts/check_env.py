@@ -14,7 +14,6 @@ REQUIRED = [
     "pandas",
     "matplotlib",
     "huggingface_hub",
-    "openpyxl",
 ]
 FAIRCHEM_CANDIDATES = ["fairchem.core", "fairchem"]
 

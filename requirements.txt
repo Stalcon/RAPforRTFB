@@ -1,0 +1,12 @@
+torch==2.8.0
+fairchem-core==2.21.0
+rdkit
+numpy
+ase
+huggingface_hub
+pyscf
+geometric
+freesasa
+pandas
+scipy
+matplotlib

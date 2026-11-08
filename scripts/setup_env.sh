@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Create the redox conda env with a backend-matched torch (cuda | rocm | cpu).
-# Usage: ./setup_env.sh [ENV_NAME]  |  BACKEND=cpu ./setup_env.sh
+# One-command setup: ./scripts/setup_env.sh [ENV_NAME]
+# BACKEND auto-detects (cuda | rocm | cpu); override with BACKEND=cpu|cuda|rocm.
 set -euo pipefail
 
 ENV_NAME="${1:-redox}"
 PY_VER="${PY_VER:-3.11}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+REQ="$ROOT/requirements.txt"
 
 BACKEND="${BACKEND:-auto}"
 ROCM_HOME="${ROCM_HOME:-/opt/rocm}"
@@ -19,7 +21,6 @@ else
     exit 1
 fi
 
-# Auto-detect backend unless BACKEND is set explicitly.
 if [ "$BACKEND" = "auto" ]; then
     if command -v nvidia-smi >/dev/null 2>&1 &&
        nvidia-smi >/dev/null 2>&1; then
@@ -36,12 +37,8 @@ if [ "$BACKEND" = "auto" ]; then
 fi
 
 case "$BACKEND" in
-    cuda|rocm|cpu)
-        ;;
-    *)
-        echo "ERROR: BACKEND must be cuda, rocm, or cpu." >&2
-        exit 1
-        ;;
+    cuda|rocm|cpu) ;;
+    *) echo "ERROR: BACKEND must be cuda, rocm, cpu, or auto." >&2; exit 1 ;;
 esac
 
 echo ">> conda: $CONDA"
@@ -49,72 +46,56 @@ echo ">> env: $ENV_NAME"
 echo ">> python: $PY_VER"
 echo ">> backend: $BACKEND"
 
-# Create env, upgrade pip, install backend-agnostic deps first.
-"$CONDA" create -n "$ENV_NAME" "python=$PY_VER" -y
+if "$CONDA" env list | grep -q "^${ENV_NAME} "; then
+    echo ">> env exists, updating in place"
+else
+    "$CONDA" create -n "$ENV_NAME" "python=$PY_VER" -y
+fi
 
 conda run -n "$ENV_NAME" python -m pip install --upgrade pip
 
-conda run -n "$ENV_NAME" pip install \
-    -r "$HERE/requirements.txt"
-
 case "$BACKEND" in
-
     cuda)
-        # Parse driver CUDA version so torch wheels match the driver.
         CUDA_VERSION="$(
             nvidia-smi 2>/dev/null |
             sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' |
             head -n1
         )"
-
         case "$CUDA_VERSION" in
             12.4*) CUDA_TAG="cu124" ;;
             12.6*) CUDA_TAG="cu126" ;;
             12.8*) CUDA_TAG="cu128" ;;
             12.9*) CUDA_TAG="cu129" ;;
-            *)
-                echo "ERROR: unsupported NVIDIA CUDA version: $CUDA_VERSION" >&2
-                echo "Set BACKEND=cpu or use a supported CUDA version." >&2
-                exit 1
-                ;;
+            *) echo "ERROR: unsupported NVIDIA CUDA version: $CUDA_VERSION" >&2
+               echo "Set BACKEND=cpu or use a supported CUDA version." >&2
+               exit 1 ;;
         esac
-
-        # torch must come from the CUDA-specific index or cuda stays False.
         conda run -n "$ENV_NAME" pip install \
             "torch==2.8.0" \
             --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
-
-        # GPU DFT backend (SMD on CUDA).
         conda run -n "$ENV_NAME" pip install \
             gpu4pyscf-cuda12x \
             cutensor-cu12
         ;;
-
     rocm)
-        # ROCm HIP torch + CuPy for AMD GPUs.
         if [ ! -d "$ROCM_HOME" ]; then
             echo "ERROR: ROCm not found at $ROCM_HOME" >&2
             exit 1
         fi
-
         export ROCM_HOME
-
         ROCM_ARCH="${ROCM_ARCH:-$(
             rocminfo 2>/dev/null |
             sed -n 's/.*Name:[[:space:]]*\(gfx[0-9a-z]*\).*/\1/p' |
             head -n1
         )}"
-
         if [ -z "$ROCM_ARCH" ]; then
             echo "ERROR: could not determine AMD GPU architecture." >&2
             echo "Set ROCM_ARCH manually, e.g. ROCM_ARCH=gfx1100." >&2
             exit 1
         fi
-
         conda run -n "$ENV_NAME" pip install \
             "torch==2.8.0" \
             --index-url "https://download.pytorch.org/whl/rocm6.4"
-
         conda run -n "$ENV_NAME" env \
             ROCM_HOME="$ROCM_HOME" \
             CUPY_INSTALL_USE_HIP=1 \
@@ -123,17 +104,17 @@ case "$BACKEND" in
             amd-cupy \
             --extra-index-url https://pypi.amd.com/simple
         ;;
-
     cpu)
-        # CPU-only torch; DFT falls back to pyscf.
         conda run -n "$ENV_NAME" pip install \
             "torch==2.8.0" \
             --index-url "https://download.pytorch.org/whl/cpu"
         ;;
-
 esac
 
-# Sanity-probe torch visibility before the full check.
+conda run -n "$ENV_NAME" pip install -r "$REQ"
+
+"$CONDA" install -n "$ENV_NAME" -c conda-forge xtb -y
+
 conda run -n "$ENV_NAME" python - <<'PY'
 import torch
 
@@ -148,7 +129,6 @@ if torch.cuda.is_available():
 PY
 
 if [ "$BACKEND" = "rocm" ]; then
-    # Verify CuPy/HIP matmul on AMD GPU.
     conda run -n "$ENV_NAME" env \
         ROCM_HOME="$ROCM_HOME" \
         python - <<'PY'
@@ -173,7 +153,6 @@ print(y)
 PY
 fi
 
-# Fail fast: full env smoke test (HERE is scripts/, so no extra scripts/ prefix).
 conda run -n "$ENV_NAME" python "$HERE/check_env.py"
 
 cat <<EOF
