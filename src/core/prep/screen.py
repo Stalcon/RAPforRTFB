@@ -1,7 +1,11 @@
+"""Identify redox groups and generate grafted products."""
+
+import warnings
+
 from rdkit import Chem
-from rdkit.Chem import AllChem
-from rdkit.Chem import Descriptors
-import build
+from rdkit.Chem import AllChem, Descriptors
+
+from . import build
 
 FAMILIES = {
     "quinone": {
@@ -39,10 +43,10 @@ FAMILIES = {
         "n_e": 1, "multi": False, "direction": -1,
     },
 }
-## Drops first one if second one matched
-SUPRESSION = {
+# Prefer a specific family when its pattern also matches a broader one.
+SUPPRESSED_BY = {
     "mono-imide": "bis-imide",
-    "pyridinium": "viologen", 
+    "pyridinium": "viologen",
 }
 FAMILY_PAT = {}
 for family, data in FAMILIES.items():
@@ -90,56 +94,57 @@ class RedoxMonomer:
         self.charge_states = []
         self.spin_map = {}
         self.props = {}
+
     def to_mol(self):
         return Chem.MolFromSmiles(self.smiles)
+
     def initialize_states(self, charge_states, spin_map):
         self.charge_states = charge_states
         self.spin_map = spin_map
 
-## Identifies matching redox families
 def identify(mol):
+    """Identify the redox families present in a molecule."""
     if mol is None:
         return []
-    matched = []
-    for  family, patterns in FAMILY_PAT.items():
-        for pattern in patterns:
-            if any(mol.HasSubstructMatch(pattern)):
-                matched.append(family)
-    for weaker, stronger in SUPRESSION.items():
+    matched = [
+        family
+        for family, patterns in FAMILY_PAT.items()
+        if any(mol.HasSubstructMatch(pattern) for pattern in patterns)
+    ]
+    for weaker, stronger in SUPPRESSED_BY.items():
         if weaker in matched and stronger in matched:
             matched.remove(weaker)
     return matched or ["other"]
 
-## Lists out attachment sites for graft reaction
 def attachment_points(mol):
+    """Return the precursor atom index and reaction type for each graft site."""
+    if mol is None:
+        return []
     points = []
     for chemistry, pattern in GRAFTS_PAT.items():
+        if pattern is None:
+            continue
         attach_q = None
         for q in range(pattern.GetNumAtoms()):
             if pattern.GetAtomWithIdx(q).GetAtomMapNum() == ATTACH_MAP:
                 attach_q = q
-            else:
-                continue
+                break
+        if attach_q is None:
+            continue
         for match in mol.GetSubstructMatches(pattern):
-            point = (match[attach_q], chemistry)
-            points.append(point)
+            points.append((match[attach_q], chemistry))
     return points
 
-## Grafts the redox small mol to the tether
-def graft_products(mol_smi):
-    precursor = Chem.MolFromSmiles(mol_smi)
-    if precursor is None:
-        raise ValueError(f"bad SMILES")
+def graft_products(mol):
+    """Generate unique capped products from the eligible graft sites."""
+    if mol is None:
+        raise ValueError("graft_products() received None; parse the SMILES first")
 
-    points = attachment_points(precursor)
-
-    seen = []
+    chemistries = list(dict.fromkeys(point[1] for point in attachment_points(mol)))
+    seen = set()
     products = []
-
-    for point in points:
-        chemistry = point[1]
-        product_sets = GRAFTS_RXN[chemistry].RunReactants((precursor,))
-        for product_set in product_sets:
+    for chemistry in chemistries:
+        for product_set in GRAFTS_RXN[chemistry].RunReactants((mol,)):
             product = product_set[0]
             try:
                 Chem.SanitizeMol(product)
@@ -147,17 +152,17 @@ def graft_products(mol_smi):
                 continue
             smi = Chem.MolToSmiles(product)
             if smi not in seen:
-                seen.append(smi)
-                products.append((smi,chemistry))
+                seen.add(smi)
+                products.append((smi, chemistry))
     return products
 
-## Builds redox ladder for grafted monomer (resting charge + spin, direction and a multiplicity hint)
-def build_states(mol:Chem.Mol, families):
+def build_states(mol: Chem.Mol, families):
+    """Propose charge states and spin multiplicities for the grafted monomer."""
     q0 = Chem.GetFormalCharge(mol)
     unpaired0 = Descriptors.NumRadicalElectrons(mol)
 
     charge_states = [q0]
-    spin_map = {q0:unpaired0+1}
+    spin_map = {q0: unpaired0 + 1}
 
     for family in families:
         if family == "other":
@@ -165,38 +170,54 @@ def build_states(mol:Chem.Mol, families):
         family_e = FAMILIES[family]["n_e"]
         direction = FAMILIES[family]["direction"]
 
-        for n in range(1, family_e+1):
-            q = q0 + direction*n
+        for n in range(1, family_e + 1):
+            q = q0 + direction * n
             unpaired = (unpaired0 + n) % 2
             if q not in charge_states:
                 charge_states.append(q)
                 spin_map[q] = unpaired + 1
     return charge_states, spin_map
 
-## Builds a list of redox monomers from a redox small mol (classifies, grafts and stereo-guards)
 def screen_mol(mol_smi, name=None):
-    precursor = Chem.MolFromSmiles(mol_smi)
-    frag_families = identify(precursor)
+    """Screen a precursor and return its grafted monomers."""
+    if not isinstance(mol_smi, str) or not mol_smi.strip():
+        raise ValueError(f"bad SMILES: {mol_smi!r}")
 
+    precursor = Chem.MolFromSmiles(mol_smi)
+    if precursor is None:
+        raise ValueError(f"bad SMILES: {mol_smi!r}")
+
+    frag_families = identify(precursor)
     monomers = []
-    
-    for smi, chemistry in graft_products(mol_smi):
+
+    for smi, chemistry in graft_products(precursor):
         grafted = Chem.MolFromSmiles(smi)
+        if grafted is None:
+            continue
         n_unspec = build.check_stereo(grafted)
         if n_unspec:
-            raise ValueError(f"{name or smi}: {n_unspec} unspecified stereo element(s) \n"+ 
-                             "Specify or enumerate isomers")
+            raise ValueError(
+                f"{name or smi}: {n_unspec} unspecified stereo element(s); "
+                "specify or enumerate isomers"
+            )
         families = identify(grafted)
         charge_states, spin_map = build_states(grafted, families)
-        redox_monomer = RedoxMonomer(
-            frag_smi=mol_smi, 
-            functionalized_smi=smi, 
-            frag_families=frag_families, 
-            families=families, 
-            attachment=chemistry, 
-            name=name)
-        redox_monomer.initialize_states(charge_states, spin_map)
-        redox_monomer.id = build.monomer_id(redox_monomer)
-        monomers.append(redox_monomer)
+        monomer = RedoxMonomer(
+            frag_smi=mol_smi,
+            functionalized_smi=smi,
+            frag_families=frag_families,
+            families=families,
+            attachment=chemistry,
+            name=name,
+        )
+        monomer.initialize_states(charge_states, spin_map)
+        monomer.id = build.monomer_id(families, smi)
+        monomers.append(monomer)
+
+    if not monomers:
+        warnings.warn(
+            f"no graftable site found for {mol_smi!r}; check GRAFTS for this core",
+            stacklevel=2,
+        )
 
     return monomers

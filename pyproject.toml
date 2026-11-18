@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rapforrtfb"
+version = "0.1.0"
+description = "Computational assessment of polymer-bound redox groups"
+requires-python = ">=3.11"
+dependencies = ["numpy", "scipy", "ase", "rdkit", "pyscf>=2.10", "geometric", "pyscf-dispersion"]
+
+[project.optional-dependencies]
+uma = ["fairchem-core==2.21.0", "huggingface_hub"]
+
+[project.scripts]
+rap = "core.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pyright]
+extraPaths = ["src"]

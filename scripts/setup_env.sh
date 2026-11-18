@@ -1,169 +1,93 @@
 #!/usr/bin/env bash
-# One-command setup: ./scripts/setup_env.sh [ENV_NAME]
-# BACKEND auto-detects (cuda | rocm | cpu); override with BACKEND=cpu|cuda|rocm.
 set -euo pipefail
 
-ENV_NAME="${1:-redox}"
-PY_VER="${PY_VER:-3.11}"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"
-REQ="$ROOT/requirements.txt"
+detect_backend() {
+    local device vendor device_class amd_found=false
 
+    if command -v nvidia-smi >/dev/null 2>&1 &&
+        nvidia-smi -L 2>/dev/null | grep '^GPU ' >/dev/null; then
+        echo cuda
+        return
+    fi
+    if command -v rocminfo >/dev/null 2>&1 &&
+        rocminfo 2>/dev/null | grep -E '^[[:space:]]*Name:[[:space:]]+gfx[[:xdigit:]]+' >/dev/null; then
+        echo rocm
+        return
+    fi
+
+    # PCI enumeration still works on Linux before the GPU driver is installed.
+    for device in /sys/bus/pci/devices/*; do
+        [[ -r "$device/class" && -r "$device/vendor" ]] || continue
+        read -r device_class < "$device/class"
+        [[ "$device_class" == 0x03* ]] || continue
+        read -r vendor < "$device/vendor"
+        case "$vendor" in
+            0x10de) echo cuda; return ;;
+            0x1002) amd_found=true ;;
+        esac
+    done
+
+    if [[ "$amd_found" == true ]]; then
+        echo rocm
+    else
+        echo cpu
+    fi
+}
+
+ENV_NAME="${1:-rap}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKEND="${BACKEND:-auto}"
-ROCM_HOME="${ROCM_HOME:-/opt/rocm}"
+if [[ "$BACKEND" == auto ]]; then
+    BACKEND="$(detect_backend)"
+fi
+
+case "$BACKEND" in
+    rocm)
+        if [ "$(uname -s)" != Linux ]; then
+            echo 'Use a supported Linux/ROCm installation for AMD UMA.' >&2
+            exit 1
+        fi
+        TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/rocm6.4}"
+        ;;
+    cuda) TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}" ;;
+    cpu) TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cpu}" ;;
+    *) echo 'Set BACKEND to auto, cpu, rocm, or cuda.' >&2; exit 1 ;;
+esac
 
 if command -v mamba >/dev/null 2>&1; then
-    CONDA="$(command -v mamba)"
+    CONDA=mamba
 elif command -v conda >/dev/null 2>&1; then
-    CONDA="$(command -v conda)"
+    CONDA=conda
 else
-    echo "ERROR: conda or mamba is required." >&2
+    echo 'Install conda or mamba first.' >&2
     exit 1
 fi
-
-if [ "$BACKEND" = "auto" ]; then
-    if command -v nvidia-smi >/dev/null 2>&1 &&
-       nvidia-smi >/dev/null 2>&1; then
-        BACKEND="cuda"
-    elif command -v rocminfo >/dev/null 2>&1 &&
-         rocminfo >/dev/null 2>&1; then
-        BACKEND="rocm"
-    elif command -v rocm-smi >/dev/null 2>&1 &&
-         rocm-smi >/dev/null 2>&1; then
-        BACKEND="rocm"
-    else
-        BACKEND="cpu"
-    fi
+if ! "$CONDA" env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+    "$CONDA" create -n "$ENV_NAME" python=3.11 -y
 fi
 
-case "$BACKEND" in
-    cuda|rocm|cpu) ;;
-    *) echo "ERROR: BACKEND must be cuda, rocm, cpu, or auto." >&2; exit 1 ;;
-esac
-
-echo ">> conda: $CONDA"
-echo ">> env: $ENV_NAME"
-echo ">> python: $PY_VER"
-echo ">> backend: $BACKEND"
-
-if "$CONDA" env list | grep -q "^${ENV_NAME} "; then
-    echo ">> env exists, updating in place"
-else
-    "$CONDA" create -n "$ENV_NAME" "python=$PY_VER" -y
-fi
-
-conda run -n "$ENV_NAME" python -m pip install --upgrade pip
-
-case "$BACKEND" in
-    cuda)
-        CUDA_VERSION="$(
-            nvidia-smi 2>/dev/null |
-            sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' |
-            head -n1
-        )"
-        case "$CUDA_VERSION" in
-            12.4*) CUDA_TAG="cu124" ;;
-            12.6*) CUDA_TAG="cu126" ;;
-            12.8*) CUDA_TAG="cu128" ;;
-            12.9*) CUDA_TAG="cu129" ;;
-            *) echo "ERROR: unsupported NVIDIA CUDA version: $CUDA_VERSION" >&2
-               echo "Set BACKEND=cpu or use a supported CUDA version." >&2
-               exit 1 ;;
-        esac
-        conda run -n "$ENV_NAME" pip install \
-            "torch==2.8.0" \
-            --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
-        conda run -n "$ENV_NAME" pip install \
-            gpu4pyscf-cuda12x \
-            cutensor-cu12
-        ;;
-    rocm)
-        if [ ! -d "$ROCM_HOME" ]; then
-            echo "ERROR: ROCm not found at $ROCM_HOME" >&2
-            exit 1
-        fi
-        export ROCM_HOME
-        ROCM_ARCH="${ROCM_ARCH:-$(
-            rocminfo 2>/dev/null |
-            sed -n 's/.*Name:[[:space:]]*\(gfx[0-9a-z]*\).*/\1/p' |
-            head -n1
-        )}"
-        if [ -z "$ROCM_ARCH" ]; then
-            echo "ERROR: could not determine AMD GPU architecture." >&2
-            echo "Set ROCM_ARCH manually, e.g. ROCM_ARCH=gfx1100." >&2
-            exit 1
-        fi
-        conda run -n "$ENV_NAME" pip install \
-            "torch==2.8.0" \
-            --index-url "https://download.pytorch.org/whl/rocm6.4"
-        conda run -n "$ENV_NAME" env \
-            ROCM_HOME="$ROCM_HOME" \
-            CUPY_INSTALL_USE_HIP=1 \
-            HCC_AMDGPU_TARGET="$ROCM_ARCH" \
-            pip install \
-            amd-cupy \
-            --extra-index-url https://pypi.amd.com/simple
-        ;;
-    cpu)
-        conda run -n "$ENV_NAME" pip install \
-            "torch==2.8.0" \
-            --index-url "https://download.pytorch.org/whl/cpu"
-        ;;
-esac
-
-conda run -n "$ENV_NAME" pip install -r "$REQ"
-
-"$CONDA" install -n "$ENV_NAME" -c conda-forge xtb -y
-
-conda run -n "$ENV_NAME" python - <<'PY'
+echo "Using $BACKEND for UMA."
+torch_install=(python -m pip install 'torch==2.8.0' --index-url "$TORCH_INDEX")
+"$CONDA" run -n "$ENV_NAME" "${torch_install[@]}"
+installed_backend="$("$CONDA" run -n "$ENV_NAME" python -c '
 import torch
 
-print("PyTorch:", torch.__version__)
-print("GPU available:", torch.cuda.is_available())
-print("CUDA version:", torch.version.cuda)
-print("HIP/ROCm version:", getattr(torch.version, "hip", None))
-
-if torch.cuda.is_available():
-    for i in range(torch.cuda.device_count()):
-        print(f"GPU {i}:", torch.cuda.get_device_name(i))
-PY
-
-if [ "$BACKEND" = "rocm" ]; then
-    conda run -n "$ENV_NAME" env \
-        ROCM_HOME="$ROCM_HOME" \
-        python - <<'PY'
-import cupy as cp
-
-n = cp.cuda.runtime.getDeviceCount()
-print("CuPy:", cp.__version__)
-print("AMD GPU count:", n)
-
-for i in range(n):
-    props = cp.cuda.runtime.getDeviceProperties(i)
-    name = props["name"]
-    if isinstance(name, bytes):
-        name = name.decode()
-    print(f"GPU {i}:", name)
-
-x = cp.arange(16, dtype=cp.float64).reshape(4, 4)
-y = x @ x
-
-print("CuPy ROCm test: OK")
-print(y)
-PY
+if torch.version.hip:
+    print("rocm")
+elif torch.version.cuda:
+    print("cuda")
+else:
+    print("cpu")
+')"
+# The public version pin can match an existing wheel for a different backend.
+if [[ "$installed_backend" != "$BACKEND" ]]; then
+    "$CONDA" run -n "$ENV_NAME" "${torch_install[@]}" --force-reinstall
 fi
 
-conda run -n "$ENV_NAME" python "$HERE/check_env.py"
-
-cat <<EOF
-
-Done.
-
-Activate with:
-  source \$(conda info --base)/etc/profile.d/conda.sh
-  conda activate $ENV_NAME
-
-Backend:
-  $BACKEND
-
-EOF
+"$CONDA" run -n "$ENV_NAME" python -m pip install -e "$ROOT[uma]"
+if [ "$BACKEND" = cuda ]; then
+    "$CONDA" run -n "$ENV_NAME" python -m pip install gpu4pyscf-cuda12x cutensor-cu12
+fi
+BACKEND="$BACKEND" "$CONDA" run -n "$ENV_NAME" python "$ROOT/scripts/check_env.py"
+echo "Activate with: conda activate $ENV_NAME"
+echo 'UMA needs approved Hugging Face model access. Authenticate with hf auth login.'
