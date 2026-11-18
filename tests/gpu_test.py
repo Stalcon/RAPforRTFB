@@ -27,7 +27,7 @@ def main():
     from core.modeling import dft, sp, uma
 
     start = time.monotonic()
-    summary = {"scope": "software smoke test, not research validation"}
+    summary = {"scope": "software smoke test"}
     try:
         summary["backend"] = describe()
         print(json.dumps(summary, indent=2), flush=True)
