@@ -10,7 +10,7 @@ from core.protocol import ACTIVE_SP, file_hash, protocol_hash, load_record, writ
 from .jobs import run_rows
 
 
-def make_mf(atoms, charge, mult, settings=None, *, memory_mb=4000, threads=4):
+def make_mf(atoms, charge, mult, settings=None, *, memory_mb=4000, threads=4, dft_module=None):
     from pyscf import gto, lib
     settings = {**ACTIVE_SP, **(settings or {})}
     electrons = int(sum(atoms.numbers)) - int(charge)
@@ -22,7 +22,7 @@ def make_mf(atoms, charge, mult, settings=None, *, memory_mb=4000, threads=4):
     mol = gto.M(atom=list(zip(atoms.get_chemical_symbols(), atoms.positions)),
                 unit="Angstrom", basis=settings["basis"], charge=int(charge), spin=int(mult) - 1,
                 max_memory=memory_mb, verbose=0)
-    module = backend.get_dft_module()
+    module = dft_module if dft_module is not None else backend.get_dft_module()
     mf = module.RKS(mol) if mult == 1 else module.UKS(mol)
     mf.xc = settings["xc"]
     if settings.get("dispersion"):
@@ -55,7 +55,16 @@ def electronic_checks(mf):
 def single_point(xyz, charge, mult, *, settings=None, out=None, memory_mb=4000, threads=4):
     xyz = Path(xyz).resolve()
     settings = {**ACTIVE_SP, **(settings or {})}
-    method = {**settings, "engine": backend.get_dft_backend_name(), "implementation_versions": runtime_versions()}
+    engine = backend.get_sp_backend_name()
+    versions = runtime_versions()
+    dft_module = None
+    if engine == "gpu4pyscf-rocm":
+        dft_module = backend.get_rocm_dft_module()
+        import cupy
+        import gpu4pyscf
+        versions.update(cupy=cupy.__version__, gpu4pyscf=gpu4pyscf.__version__,
+                        hip_runtime=cupy.cuda.runtime.runtimeGetVersion())
+    method = {**settings, "engine": engine, "implementation_versions": versions}
     key = protocol_hash(file_hash(xyz), charge, mult, method)
     if out and Path(out).exists():
         try:
@@ -65,7 +74,8 @@ def single_point(xyz, charge, mult, *, settings=None, out=None, memory_mb=4000, 
         if old.get("protocol_hash") == key and old.get("status") == "complete":
             return old
     atoms = read(xyz)
-    mf = make_mf(atoms, charge, mult, settings, memory_mb=memory_mb, threads=threads)
+    mf = make_mf(atoms, charge, mult, settings, memory_mb=memory_mb, threads=threads,
+                 dft_module=dft_module)
     if out:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         mf.chkfile = str(Path(out).with_suffix(".chk"))

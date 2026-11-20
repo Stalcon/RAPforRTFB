@@ -53,6 +53,28 @@ def get_dft_module(backend=None):
     return importlib.import_module(get_dft_backend_name(backend) + ".dft")
 
 
+def get_sp_backend_name():
+    requested = os.environ.get("SP_BACKEND", "auto").lower()
+    if requested == "rocm":
+        return "gpu4pyscf-rocm"
+    if requested != "auto":
+        raise ValueError("SP_BACKEND must be auto or rocm")
+    return get_dft_backend_name()
+
+
+def get_rocm_dft_module():
+    try:
+        import cupy
+        if not cupy.cuda.runtime.is_hip or not cupy.cuda.runtime.getDeviceCount():
+            raise RuntimeError("ROCm CuPy did not find an AMD GPU")
+        return importlib.import_module("gpu4pyscf.dft")
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            "SP_BACKEND=rocm requires a HIP build of GPU4PySCF and ROCm CuPy "
+            f"with access to an AMD GPU: {exc}"
+        ) from exc
+
+
 def get_geomopt_fn():
     from pyscf.geomopt.geometric_solver import optimize
     return optimize
