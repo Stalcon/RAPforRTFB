@@ -1,4 +1,4 @@
-"""Solvated geometry optimization and explicitly defined thermochemistry."""
+"""Optimize molecular geometries and calculate thermal corrections."""
 from pathlib import Path
 import sys
 
@@ -19,11 +19,7 @@ def _atoms(molecule):
 
 def thermal_correction(mf, *, directory, temperature=298.15, pressure=101325.0,
                        model="rrho", cutoffs=(25.0, 50.0, 100.0)):
-    """Native DFT Hessian; RRHO or an explicitly separate entropy-only qRRHO model.
-
-    This is not the manuscript's certified xTB-kernel partition implementation.
-    Two Hessian columns are checked at two displacements, not the whole Hessian.
-    """
+    """Get the thermal correction from a DFT Hessian."""
     from pyscf.hessian import thermo
     from pyscf.data import nist
     from scipy.constants import Boltzmann, Planck, speed_of_light
@@ -31,16 +27,14 @@ def thermal_correction(mf, *, directory, temperature=298.15, pressure=101325.0,
         raise ValueError("positive thermodynamic conditions and rrho/qrrho required")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    if hasattr(mf, "to_cpu"):
-        mf = mf.to_cpu()
     gradient = mf.nuc_grad_method()
     gradient.grid_response = True
-    center = gradient.kernel()
+    center = backend.host_array(gradient.kernel())
     if not np.isfinite(center).all() or np.max(np.abs(center)) > 4.5e-4:
         raise ValueError("geometry fails maximum Cartesian gradient threshold")
     hessian_driver = mf.Hessian()
     hessian_driver.grid_response = True
-    hessian = hessian_driver.kernel()
+    hessian = backend.host_array(hessian_driver.kernel())
     n = mf.mol.natm
     matrix = hessian.transpose(0, 2, 1, 3).reshape(3 * n, 3 * n)
     np.save(directory / "hessian.npy", hessian)
@@ -61,16 +55,16 @@ def thermal_correction(mf, *, directory, temperature=298.15, pressure=101325.0,
                 displaced = coords.copy()
                 displaced[atom, axis] += sign * step
                 molecule = original_molecule.copy().set_geom_(displaced, unit="Bohr")
-                energy, value = scanner(molecule)
+                _, value = scanner(molecule)
                 if not scanner.base.converged:
                     raise ValueError("displaced-gradient SCF did not converge")
-                gradients.append(np.asarray(value).ravel())
+                gradients.append(np.asarray(backend.host_array(value)).ravel())
             fd = (gradients[1] - gradients[0]) / (2 * step)
             exact = matrix[:, 3 * atom + axis]
             error = float(np.linalg.norm(fd - exact) / max(np.linalg.norm(exact), 1e-12))
             probes.append({"atom": atom, "axis": axis, "step_bohr": step, "relative_error": error})
             np.save(directory / f"probe_{atom}_{axis}_{step}.npy", gradients)
-    # Restore the central geometry before the partition calculation.
+    # Use the original geometry for thermochemistry after the displaced gradients.
     mf.reset(original_molecule)
     mf.e_tot = original_energy
     if any(not np.isfinite(p["relative_error"]) or p["relative_error"] > 0.01 for p in probes):
@@ -80,13 +74,13 @@ def thermal_correction(mf, *, directory, temperature=298.15, pressure=101325.0,
     if not np.isfinite(frequencies).all() or np.any(frequencies < -5) or np.any(frequencies == 0):
         raise ValueError("unstable or zero internal vibrational mode")
     partition = thermo.thermo(mf, np.abs(modes["freq_au"]), temperature, pressure)
-    # The nuclear partition excludes the electronic spin contribution.
+    # Add electronic spin entropy separately from the nuclear terms.
     nuclear = sum(partition[k][0] for k in ("G_trans", "G_rot", "G_vib"))
     electronic_entropy = -temperature * partition["S_elec"][0]
     rrho = float((nuclear + electronic_entropy) * HARTREE_EV)
     values = {}
     if model == "qrrho":
-        # Grimme-style entropy interpolation with a fixed 1e-44 kg m² rotor inertia.
+        # Blend oscillator and rotor entropy for each mode using a fixed rotor inertia.
         nu = np.abs(frequencies) * speed_of_light * 100
         x = Planck * nu / (Boltzmann * temperature)
         expneg = np.exp(-x)
@@ -103,7 +97,8 @@ def thermal_correction(mf, *, directory, temperature=298.15, pressure=101325.0,
         if "50.0" not in values:
             raise ValueError("primary 50 cm^-1 cutoff required")
     protocol = {"model": "PySCF-RRHO" if model == "rrho" else "entropy-only-qRRHO-fixed-inertia",
-                "engine": "pyscf_cpu", "implementation_versions": runtime_versions(),
+                "engine": "gpu4pyscf" if backend.is_gpu_mean_field(mf) else "pyscf_cpu",
+                "implementation_versions": runtime_versions(),
                 "temperature_K": temperature, "pressure_Pa": pressure,
                 "standard_state": "1atm" if pressure == 101325 else f"{pressure}Pa",
                 "mode_projection": "PySCF mass-weighted translation/rotation exclusion",
@@ -127,7 +122,8 @@ def optimize_state(xyz, charge, mult, *, directory, settings=None, thermal=False
     chosen = {**GEOMETRY, **(settings or {})}
     if settings is None and charge < 0:
         chosen["basis"] = "def2-svpd"
-    method = {**chosen, "engine": backend.get_dft_backend_name(), "implementation_versions": runtime_versions()}
+    method = {**chosen, "engine": backend.get_dft_backend_name(),
+              "accelerator": backend.resolve_dft_backend(), "implementation_versions": runtime_versions()}
     request = {**method, "maxsteps": maxsteps, "thermal": thermal, "thermal_model": thermal_model}
     key = protocol_hash(file_hash(xyz), charge, mult, request)
     work = directory / "attempts" / key[:20]
@@ -154,7 +150,7 @@ def optimize_state(xyz, charge, mult, *, directory, settings=None, thermal=False
     qc = electronic_checks(mf)
     gradient = mf.nuc_grad_method()
     gradient.grid_response = True
-    maximum = float(np.max(np.abs(gradient.kernel())))
+    maximum = float(np.max(np.abs(backend.host_array(gradient.kernel()))))
     if not converged or not np.isfinite(maximum) or maximum > 4.5e-4:
         raise RuntimeError(f"geometry optimization failed (max gradient {maximum})")
     record = {"status": "complete", "optimization_status": "passed", "thermal_status": "not_requested",
@@ -167,7 +163,7 @@ def optimize_state(xyz, charge, mult, *, directory, settings=None, thermal=False
         record["e_smd_eV"] = record["energy_eV"]
     record["thermal_geometry_family"] = ({**method, "basis": "def2-svpd if anionic; def2-svp otherwise"}
                                          if settings is None else method)
-    # Preserve geometry even if expensive Hessian work fails or is interrupted.
+    # Save the optimized geometry now so a failed Hessian run leaves it available.
     write_record(work / "geometry.json", record)
     if thermal:
         record.update(thermal_correction(mf, directory=work, model=thermal_model))
@@ -186,7 +182,7 @@ def run_batch(*, from_library=False, **kwargs):
             record = load_record(UMA / row["id"] / row["state"] / "result.json")
             if record.get('status') != 'complete':
                 raise ValueError('UMA state did not complete with a valid graph')
-            # Keep the declared spin until DFT spin ordering is checked.
+            # Use the declared multiplicity until DFT establishes the spin ordering.
             mult = int(row["mult_hint"])
             paths = [Path(c["geometry"]) for c in record["conformers"] if c["mult"] == mult]
         if not paths:

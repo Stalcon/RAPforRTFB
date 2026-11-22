@@ -10,3 +10,5 @@ freesasa
 pandas
 scipy
 matplotlib
+
+pyscf-dispersion

@@ -38,19 +38,62 @@ def get_uma_device(backend=None):
     return "cuda:0"
 
 
-def get_dft_backend_name(backend=None):
+def _cupy_backend():
+    import cupy
+    if cupy.cuda.runtime.getDeviceCount() < 1:
+        raise RuntimeError("CuPy cannot see a GPU")
+    return "rocm" if cupy.cuda.runtime.is_hip else "cuda"
+
+
+def resolve_dft_backend(backend=None):
     requested = os.environ.get("DFT_BACKEND", "auto").lower()
-    if requested == "rocm":
-        raise RuntimeError("AMD DFT is not implemented; set DFT_BACKEND=cpu")
-    if requested not in ("auto", "cpu", "cuda"):
-        raise ValueError("DFT_BACKEND must be auto, cpu, or cuda")
-    if requested == "auto":
-        requested = "cuda" if resolve_backend(backend) == "cuda" else "cpu"
-    return "gpu4pyscf" if requested == "cuda" else "pyscf"
+    if requested not in ("auto", "cpu", "cuda", "rocm"):
+        raise ValueError("DFT_BACKEND must be auto, cpu, cuda, or rocm")
+    if requested != "auto":
+        return requested
+    preference = (backend or os.environ.get("BACKEND", "auto")).lower()
+    if preference != "auto":
+        return resolve_backend(preference)
+    # Probe the DFT runtime before importing PyTorch so ROCm uses CuPy's HIP compiler.
+    try:
+        return _cupy_backend()
+    except (ImportError, OSError, RuntimeError):
+        return resolve_backend()
+
+
+def get_dft_backend_name(backend=None):
+    return "pyscf" if resolve_dft_backend(backend) == "cpu" else "gpu4pyscf"
 
 
 def get_dft_module(backend=None):
-    return importlib.import_module(get_dft_backend_name(backend) + ".dft")
+    selected = resolve_dft_backend(backend)
+    if selected == "cpu":
+        return importlib.import_module("pyscf.dft")
+    try:
+        device = _cupy_backend()
+        if device != selected:
+            raise RuntimeError(f"CuPy is using {device}, expected {selected}")
+        package = importlib.import_module("gpu4pyscf")
+        compiled = getattr(package, "BACKEND", "cuda")
+        expected = "hip" if selected == "rocm" else "cuda"
+        if compiled != expected:
+            raise RuntimeError(f"GPU4PySCF is built for {compiled}, expected {expected}")
+        return package.dft
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"DFT selected {selected} but its GPU4PySCF runtime is unavailable: {exc}. "
+            "Install the matching GPU build or explicitly set DFT_BACKEND=cpu."
+        ) from exc
+
+
+def is_gpu_mean_field(mf):
+    # Density fitting wraps SCF objects in dynamically generated classes.
+    return any(cls.__module__.startswith("gpu4pyscf.") for cls in type(mf).__mro__)
+
+
+def host_array(value):
+    """Transfer computed derivatives for file output and host-side analysis."""
+    return value.get() if hasattr(value, "get") else value
 
 
 def get_geomopt_fn():
@@ -58,9 +101,18 @@ def get_geomopt_fn():
     return optimize
 
 
-def describe():
-    result = {"requested_backend": resolve_backend(), "dft_engine": get_dft_backend_name(),
-              "amd_dft_acceleration": False}
+def describe(*, include_uma=True):
+    dft_backend = resolve_dft_backend()
+    result = {"dft_backend": dft_backend, "dft_engine": get_dft_backend_name()}
+    if dft_backend != "cpu":
+        try:
+            get_dft_module()
+        except RuntimeError as exc:
+            result["dft_error"] = str(exc)
+    result["amd_dft_acceleration"] = dft_backend == "rocm" and "dft_error" not in result
+    if not include_uma:
+        return result
+    result["requested_backend"] = resolve_backend()
     try:
         import torch
         result.update(torch_version=torch.__version__, hip_version=torch.version.hip,

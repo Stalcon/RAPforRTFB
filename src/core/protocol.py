@@ -25,7 +25,11 @@ def geometry_hash(path):
 
 def runtime_versions():
     result = {}
-    for name in ("rapforrtfb", "numpy", "ase", "pyscf", "pyscf-dispersion", "gpu4pyscf", "fairchem-core", "torch"):
+    packages = ("rapforrtfb", "numpy", "ase", "pyscf", "pyscf-dispersion",
+                "gpu4pyscf", "gpu4pyscf-cuda11x", "gpu4pyscf-cuda12x", "gpu4pyscf-cuda13x",
+                "gpu4pyscf-rocm6x", "gpu4pyscf-rocm7x", "gpu4pyscf-rocmx",
+                "cupy", "cupy-cuda11x", "cupy-cuda12x", "cupy-cuda13x", "fairchem-core", "torch")
+    for name in packages:
         try:
             result[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

@@ -44,7 +44,7 @@ fi
 case "$BACKEND" in
     rocm)
         if [ "$(uname -s)" != Linux ]; then
-            echo 'Use a supported Linux/ROCm installation for AMD UMA.' >&2
+            echo 'Use a supported Linux/ROCm installation for AMD acceleration.' >&2
             exit 1
         fi
         TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/rocm6.4}"
@@ -85,9 +85,27 @@ if [[ "$installed_backend" != "$BACKEND" ]]; then
 fi
 
 "$CONDA" run -n "$ENV_NAME" python -m pip install -e "$ROOT[uma]"
-if [ "$BACKEND" = cuda ]; then
-    "$CONDA" run -n "$ENV_NAME" python -m pip install gpu4pyscf-cuda12x cutensor-cu12
+dft_target="${DFT_BACKEND:-auto}"
+if [[ "$dft_target" == auto ]]; then
+    dft_target="$BACKEND"
 fi
+case "$dft_target" in
+    cuda)
+        "$CONDA" run -n "$ENV_NAME" python -m pip install gpu4pyscf-cuda12x cutensor-cu12
+        ;;
+    rocm)
+        if ! "$CONDA" run -n "$ENV_NAME" python -c 'import sys, cupy; sys.exit(not (cupy.cuda.runtime.is_hip and cupy.cuda.runtime.getDeviceCount() > 0))'; then
+            echo "Install a working ROCm build of CuPy in $ENV_NAME, then rerun setup. See README.md." >&2
+            exit 1
+        fi
+        if ! DFT_BACKEND=rocm "$CONDA" run -n "$ENV_NAME" python -c 'from core.backend import get_dft_module; get_dft_module()'; then
+            hip_source="git+https://github.com/pyscf/gpu4pyscf.git@6cf69ba3bd9f530039e7ca23e38ec062184fad81"
+            GPU4PYSCF_BACKEND=hip "$CONDA" run -n "$ENV_NAME" python -m pip install "$hip_source"
+        fi
+        ;;
+    cpu) ;;
+    *) echo 'Set DFT_BACKEND to auto, cpu, rocm, or cuda.' >&2; exit 1 ;;
+esac
 BACKEND="$BACKEND" "$CONDA" run -n "$ENV_NAME" python "$ROOT/scripts/check_env.py"
 echo "Activate with: conda activate $ENV_NAME"
 echo 'UMA needs approved Hugging Face model access. Authenticate with hf auth login.'
