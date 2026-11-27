@@ -48,12 +48,29 @@ def evaluate_criterion(evidence, bounds):
     return "pending"
 
 
+def capacity_ceiling_decision(ceiling_mAh_g, minimum_mAh_g):
+    """Exclude only when the declared polymer's upper bound is below the floor."""
+    if ceiling_mAh_g is None or minimum_mAh_g is None:
+        return "pending"
+    ceiling, minimum = map(to_float, (ceiling_mAh_g, minimum_mAh_g))
+    if ceiling < 0 or minimum < 0:
+        raise ValueError("capacity ceiling and minimum must be nonnegative")
+    return "fail" if ceiling < minimum else "pending"
+
+
 def _candidate_criterion(candidate, criterion, item, bounds):
     # Attachment evidence belongs to the synthesis route. Other evidence belongs to the operating conditions.
     context = ("route_context" if criterion in ("practical_attachment", "route_thermodynamics")
                else "operating_context")
     if item and (item.get("identity") != candidate["identity"] or item.get(context) != candidate[context]):
         raise ValueError(f"mismatched identity/context for {criterion}")
+    if criterion == "material_capacity" and item and "capacity_ceiling_mAh_g" in item:
+        if item.get("qualified") is not True:
+            return "pending"
+        ceiling_decision = capacity_ceiling_decision(
+            item["capacity_ceiling_mAh_g"], bounds[0] if bounds else None)
+        if ceiling_decision == "fail" or item.get("interval") is None:
+            return ceiling_decision
     return evaluate_criterion(item, bounds)
 
 

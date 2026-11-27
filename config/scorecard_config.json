@@ -1,0 +1,23 @@
+{
+  "THRESHOLDS": {
+    "redox_window": [
+      -3.0,
+      2.0
+    ],
+    "material_capacity": [
+      30.0,
+      null
+    ],
+    "state_stability": null,
+    "charge_transfer": null,
+    "practical_attachment": null,
+    "route_thermodynamics": [
+      null,
+      0.0
+    ],
+    "motif_association": null,
+    "intersite_coupling": null,
+    "occupancy_sensitivity": null,
+    "polymer_accessibility": null
+  }
+}
