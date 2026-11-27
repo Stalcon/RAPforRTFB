@@ -1,5 +1,5 @@
 """Check whether a candidate meets the requirements for selection."""
-from core.paths import to_float
+from core.paths import load_config, to_float
 
 REQUIRED_CRITERIA = ("redox_window", "material_capacity", "state_stability", "charge_transfer",
                      "practical_attachment", "route_thermodynamics", "motif_association",
@@ -56,6 +56,18 @@ def capacity_ceiling_decision(ceiling_mAh_g, minimum_mAh_g):
     if ceiling < 0 or minimum < 0:
         raise ValueError("capacity ceiling and minimum must be nonnegative")
     return "fail" if ceiling < minimum else "pending"
+
+
+def screen_polymer_capacity(mass_g_mol, graft_count, electrons_per_graft):
+    """Screen one dry polymer composition before scheduling calculations."""
+    from core.properties.polymer import polymer_capacity
+
+    minimum = load_config("scorecard_config")["THRESHOLDS"]["material_capacity"][0]
+    result = {"capacity_ceiling_mAh_g": None}
+    if None not in (mass_g_mol, graft_count, electrons_per_graft):
+        result = polymer_capacity(mass_g_mol, graft_count, electrons_per_graft)
+    return {**result, "minimum_mAh_g": minimum,
+            "decision": capacity_ceiling_decision(result["capacity_ceiling_mAh_g"], minimum)}
 
 
 def _candidate_criterion(candidate, criterion, item, bounds):
